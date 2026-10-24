@@ -384,3 +384,76 @@ def train_ch8(net, train_iter, vocab, lr, num_epochs, device,
     print(f'perplexity {ppl:.1f}, {speed:.1f} token/s {str(device)}')
     print(predict('time traveller'))
     print(predict('traveller'))
+
+
+# Seq2Seq machine-translation utilities
+
+def sequence_mask(X, valid_len, value=0):
+    """Mask positions after each sequence's valid length (batch dimension first)."""
+    maxlen = X.size(1)
+    mask = torch.arange(maxlen, device=X.device)[None, :] < valid_len.to(X.device)[:, None]
+    X = X.clone()
+    X[~mask] = value
+    return X
+
+
+class MaskedSoftmaxCELoss(nn.CrossEntropyLoss):
+    """Cross-entropy loss, excluding padding tokens (D2L-style per-step mean)."""
+
+    def forward(self, pred, label, valid_len):
+        # pred: (batch_size, num_steps, vocab_size)
+        # label: (batch_size, num_steps); valid_len: (batch_size,)
+        weights = sequence_mask(torch.ones_like(label, dtype=pred.dtype), valid_len)
+        unweighted_loss = F.cross_entropy(pred.permute(0, 2, 1), label, reduction='none')
+        return (unweighted_loss * weights).mean(dim=1)
+
+
+def train_seq2seq(net, data_iter, lr, num_epochs, tgt_vocab, device):
+    """Train a Seq2Seq model, compatible with tensor or (logits, state) outputs."""
+
+    def xavier_init_weights(m):
+        if isinstance(m, nn.Linear):
+            # LazyLinear parameters are initialized when the first input arrives.
+            if not isinstance(m, nn.LazyLinear):
+                nn.init.xavier_uniform_(m.weight)
+        elif isinstance(m, nn.GRU):
+            for name, param in m.named_parameters():
+                if 'weight' in name:
+                    nn.init.xavier_uniform_(param)
+
+    net.apply(xavier_init_weights)
+    net.to(device)
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+    loss = MaskedSoftmaxCELoss()
+    animator = d2l.Animator(xlabel='epoch', ylabel='loss', xlim=[10, num_epochs])
+    net.train()
+
+    for epoch in range(num_epochs):
+        timer = d2l.Timer()
+        metric = d2l.Accumulator(2)
+        for batch in data_iter:
+            optimizer.zero_grad()
+            X, X_valid_len, Y, Y_valid_len = [x.to(device) for x in batch]
+
+            # Teacher forcing: <bos> followed by all target tokens except the last.
+            bos = torch.full((Y.shape[0], 1), tgt_vocab['<bos>'],
+                             dtype=Y.dtype, device=device)
+            dec_input = torch.cat((bos, Y[:, :-1]), dim=1)
+
+            result = net(X, dec_input, X_valid_len)
+            # D2L versions differ: some return logits; others return (logits, state).
+            Y_hat = result[0] if isinstance(result, (tuple, list)) else result
+
+            l = loss(Y_hat, Y, Y_valid_len)
+            l.sum().backward()
+            grad_clipping(net, 1)
+            optimizer.step()
+
+            with torch.no_grad():
+                metric.add(l.sum(), Y_valid_len.sum())
+
+        if (epoch + 1) % 10 == 0:
+            animator.add(epoch + 1, (metric[0] / metric[1],))
+
+    print(f'loss {metric[0] / metric[1]:.3f}, '
+          f'{metric[1] / timer.stop():.1f} tokens/sec on {device}')
